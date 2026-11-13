@@ -37,9 +37,16 @@ OSDefineMetaClassAndStructors(IOSDHostDriver, IOService);
 ///
 IOReturn IOSDHostDriver::submitBlockRequest(IOSDBlockRequest::Processor processor, IOMemoryDescriptor* buffer, UInt64 block, UInt64 nblocks, IOStorageAttributes* attributes, IOStorageCompletion* completion)
 {
+    // Validate before allocating a request or issuing DMA. Division avoids
+    // overflowing the byte count for an invalid, very large block count.
+    if (processor == nullptr || buffer == nullptr || completion == nullptr ||
+        nblocks == 0 || nblocks > UINT64_MAX - block ||
+        buffer->getLength() % 512 != 0 || buffer->getLength() / 512 != nblocks)
+    {
+        return kIOReturnBadArgument;
+    }
+
     pinfo("BREQ: Start Block Index = %llu; Number of Blocks = %llu; Number of Bytes = %llu.", block, nblocks, nblocks * 512);
-    
-    psoftassert(buffer->getLength() == nblocks * 512, "Buffer lengths mismatched.");
     
     // Guard: Ensure that the queue event source is still enabled
     // It is enabled if and only if the card is not ejected or removed.
@@ -50,11 +57,19 @@ IOReturn IOSDHostDriver::submitBlockRequest(IOSDBlockRequest::Processor processo
         return kIOReturnNoMedia;
     }
     
+    // A zero limit cannot make progress when splitting a request.
+    const UInt64 maxRequestNumBlocks = this->host->getDMALimits().maxRequestNumBlocks();
+
+    if (maxRequestNumBlocks == 0)
+    {
+        return kIOReturnNotReady;
+    }
+
     // Guard: The maximum number of blocks in one request is 1024 (for example)
     // Split the incoming request into multiple smaller one if necessary
     IOSDBlockRequest* request = nullptr;
 
-    if (nblocks <= this->host->getDMALimits().maxRequestNumBlocks())
+    if (nblocks <= maxRequestNumBlocks)
     {
         request = this->simpleBlockRequestPool->getCommand();
     }
