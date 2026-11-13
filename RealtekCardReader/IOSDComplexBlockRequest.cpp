@@ -70,6 +70,17 @@ void IOSDComplexBlockRequest::deinit()
 ///
 void IOSDComplexBlockRequest::service()
 {
+    // Recheck at service time as well as submission: a zero DMA limit would
+    // otherwise leave the split loop running without making progress.
+    const UInt64 maxRequestNumBlocks = this->driver->getHostDevice()->getDMALimits().maxRequestNumBlocks();
+
+    if (maxRequestNumBlocks == 0)
+    {
+        IOStorage::complete(&this->completion, kIOReturnNotReady, 0);
+
+        return;
+    }
+
     // Guard: A buffer that describes a portion of data to be transfered in the current DMA transaction
     IOSubMemoryDescriptor* buffer = OSTypeAlloc(IOSubMemoryDescriptor);
     
@@ -84,9 +95,6 @@ void IOSDComplexBlockRequest::service()
     
     // The service status
     IOReturn status = kIOReturnSuccess;
-    
-    // The maximum number of blocks to be transferred in one transaction
-    UInt64 maxRequestNumBlocks = this->driver->getHostDevice()->getDMALimits().maxRequestNumBlocks();
     
     pinfo("BREQ: Servicing the complex request: Start index = %llu; Number of blocks = %llu.", this->block, this->nblocks);
     
@@ -122,15 +130,16 @@ void IOSDComplexBlockRequest::service()
         pinfo("BREQ: Serviced the intermediate transaction: Current start index = %llu; Number of blocks = %llu.", this->cblock, this->cnblocks);
         
         // The intermediate request completes without errors
-        this->cblock += maxRequestNumBlocks;
+        this->cblock += this->cnblocks;
     }
     
     // Complete the request
     UInt64 actualByteCount = status == kIOReturnSuccess ? this->nblocks * 512 : 0;
 
-    IOStorage::complete(&this->completion, status, actualByteCount);
-    
+    // Drop the subrange's reference to the caller's buffer before completion.
     OSSafeReleaseNULL(this->buffer);
+
+    IOStorage::complete(&this->completion, status, actualByteCount);
     
     pinfo("The request is completed. Return value = 0x%08x.", status);
 }
