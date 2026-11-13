@@ -352,6 +352,12 @@ IOReturn IOSDBlockStorageDevice::doAsyncReadWrite(IOMemoryDescriptor* buffer, UI
         return kIOReturnNotAttached;
     }
     
+    // Guard: Reject malformed requests before dereferencing caller data.
+    if (buffer == nullptr || completion == nullptr || nblks == 0)
+    {
+        return kIOReturnBadArgument;
+    }
+
     // Guard: Check the buffer direction
     IODirection direction = buffer->getDirection();
     
@@ -363,7 +369,7 @@ IOReturn IOSDBlockStorageDevice::doAsyncReadWrite(IOMemoryDescriptor* buffer, UI
     }
     
     // Guard: Ensure that the request does not access an out-of-bounds block
-    if (block + nblks > this->numBlocks)
+    if (block >= this->numBlocks || nblks > this->numBlocks - block)
     {
         perr("The incoming request attempts to access an out-of-bounds block.");
         
