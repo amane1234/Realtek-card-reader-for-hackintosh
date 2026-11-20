@@ -83,7 +83,10 @@ void IOSDHostDevice::onSDCardRemovedCompletion(void* parameter, IOReturn status,
     pinfo("The card removal event has been processed. Result = 0x%08x.", status);
     
     // Remove the card characteristics
-    this->removeProperty(kIOSDCardCharacteristics);
+    if (status != kIOReturnAborted)
+    {
+        this->removeProperty(kIOSDCardCharacteristics);
+    }
     
     // Invoke the completion routine supplied by the controller
     IOSDCard::complete(reinterpret_cast<IOSDCard::Completion*>(parameter), status, characteristics);

@@ -274,6 +274,10 @@ public:
         
     public:
         ///
+        /// Whether this event has a completion to deliver.
+        bool hasAction() const { return this->action != nullptr; }
+
+        ///
         /// Default constructor
         ///
         Completion() = default;

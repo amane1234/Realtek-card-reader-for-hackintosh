@@ -1725,7 +1725,7 @@ private:
     /// @note This function is a private helper of `RealtekCardReaderController::createCardSlot().`
     /// @note When this function is called, the card slot is guaranteed to be non-null.
     ///
-    bool setupCardSlot();
+    bool setupCardSlot(RealtekSDXCSlot* newSlot);
     
 protected:
     ///
@@ -1740,11 +1740,11 @@ protected:
     {
         pinfo("Allocating the card slot...");
         
-        this->slot = OSTypeAlloc(Slot);
+        auto newSlot = OSTypeAlloc(Slot);
         
-        if (this->slot != nullptr)
+        if (newSlot != nullptr)
         {
-            return this->setupCardSlot();
+            return this->setupCardSlot(newSlot);
         }
         else
         {

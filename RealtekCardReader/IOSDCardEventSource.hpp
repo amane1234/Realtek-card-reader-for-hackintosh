@@ -9,6 +9,7 @@
 #define IOSDCardEventSource_hpp
 
 #include <IOKit/IOEventSource.h>
+#include <IOKit/IOLocks.h>
 #include "IOSDCard.hpp"
 
 /// An event source to signal the workloop to process the card insertion or removal event
@@ -19,6 +20,11 @@ class IOSDCardEventSource: public IOEventSource
     
     using super = IOEventSource;
     
+    // The controller and processor use different work loops.
+    IOLock* eventLock = nullptr;
+
+    void free() override;
+
     /// The completion routine
     IOSDCard::Completion completion;
     

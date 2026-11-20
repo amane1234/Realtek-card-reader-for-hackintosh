@@ -605,6 +605,12 @@ void RealtekCardReaderController::onSDCardInsertedGated(IOSDCard::Completion* co
     // Notify the host device
     pinfo("A SD card is inserted.");
     
+    if (this->slot == nullptr)
+    {
+        IOSDCard::complete(completion, kIOReturnNotReady);
+        return;
+    }
+
     this->slot->onSDCardInsertedGated(completion, options);
 }
 
@@ -622,8 +628,21 @@ void RealtekCardReaderController::onSDCardRemovedGated(IOSDCard::Completion* com
     // Notify the host device
     pinfo("The SD card has been removed.");
     
+    if (this->slot == nullptr)
+    {
+        IOSDCard::complete(completion, kIOReturnNotReady);
+        return;
+    }
+
     this->slot->onSDCardRemovedGated(completion, options);
 }
+
+// The waiter and its completion access this result under the controller gate.
+struct CardEventResult
+{
+    bool done = false;
+    IOReturn status = kIOReturnSuccess;
+};
 
 ///
 /// Helper interrupt service routine that runs synchronously when a SD card is inserted
@@ -638,17 +657,20 @@ IOReturn RealtekCardReaderController::onSDCardInsertedSyncGated(IOSDCard::EventO
 {
     pinfo("A SD card is inserted. Waiting until the host driver finishes processing the event.");
     
-    IOReturn status = kIOReturnSuccess;
+    CardEventResult result;
     
-    auto completion = IOSDCard::Completion::withMemberFunction(this, &RealtekCardReaderController::onSDCardEventProcessedSyncCompletion, &status);
+    auto completion = IOSDCard::Completion::withMemberFunction(this, &RealtekCardReaderController::onSDCardEventProcessedSyncCompletion, &result);
     
     this->onSDCardInsertedGated(&completion, options);
     
-    this->commandGate->commandSleep(&status);
+    while (!result.done)
+    {
+        this->commandGate->commandSleep(&result);
+    }
     
-    pinfo("The host driver has processed the card insertion event. Status = 0x%08x.", status);
+    pinfo("The host driver has processed the card insertion event. Status = 0x%08x.", result.status);
     
-    return status;
+    return result.status;
 }
 
 ///
@@ -664,17 +686,20 @@ IOReturn RealtekCardReaderController::onSDCardRemovedSyncGated(IOSDCard::EventOp
 {
     pinfo("The SD card has been removed. Waiting until the host driver finishes processing the event.");
     
-    IOReturn status = kIOReturnSuccess;
+    CardEventResult result;
     
-    auto completion = IOSDCard::Completion::withMemberFunction(this, &RealtekCardReaderController::onSDCardEventProcessedSyncCompletion, &status);
+    auto completion = IOSDCard::Completion::withMemberFunction(this, &RealtekCardReaderController::onSDCardEventProcessedSyncCompletion, &result);
     
     this->onSDCardRemovedGated(&completion, options);
     
-    this->commandGate->commandSleep(&status);
+    while (!result.done)
+    {
+        this->commandGate->commandSleep(&result);
+    }
     
-    pinfo("The host driver has processed the card removal event. Status = 0x%08x.", status);
+    pinfo("The host driver has processed the card removal event. Status = 0x%08x.", result.status);
     
-    return status;
+    return result.status;
 }
 
 ///
@@ -689,9 +714,14 @@ void RealtekCardReaderController::onSDCardEventProcessedSyncCompletion(void* par
 {
     pinfo("The card event has been processed. Status = 0x%08x.", status);
     
-    *reinterpret_cast<IOReturn*>(parameter) = status;
-    
-    this->commandGate->commandWakeup(parameter);
+    IOCommandGateRunAction(this->commandGate, [&]() -> IOReturn
+    {
+        auto result = static_cast<CardEventResult*>(parameter);
+        result->status = status;
+        result->done = true;
+        this->commandGate->commandWakeup(result);
+        return kIOReturnSuccess;
+    });
 }
 
 //
@@ -762,39 +792,54 @@ bool RealtekCardReaderController::setupWorkLoop()
 /// @note This function is a private helper of `RealtekCardReaderController::createCardSlot().`
 /// @note When this function is called, the card slot is guaranteed to be non-null.
 ///
-bool RealtekCardReaderController::setupCardSlot()
+bool RealtekCardReaderController::setupCardSlot(RealtekSDXCSlot* newSlot)
 {
-    passert(this->slot != nullptr, "The card slot instance should be non-null at this moment.");
+    passert(newSlot != nullptr, "The card slot instance should be non-null at this moment.");
     
-    if (!this->slot->init())
+    if (!newSlot->init())
     {
         perr("Failed to initialize the card slot.");
         
-        OSSafeReleaseNULL(this->slot);
+        OSSafeReleaseNULL(newSlot);
         
         return false;
     }
     
-    if (!this->slot->attach(this))
+    if (!newSlot->attach(this))
     {
         perr("Failed to attach the card slot.");
         
-        OSSafeReleaseNULL(this->slot);
+        OSSafeReleaseNULL(newSlot);
         
         return false;
     }
     
-    if (!this->slot->start(this))
+    if (!newSlot->start(this))
     {
         perr("Failed to start the card slot.");
         
-        this->slot->detach(this);
+        newSlot->detach(this);
         
-        OSSafeReleaseNULL(this->slot);
+        OSSafeReleaseNULL(newSlot);
         
         return false;
     }
     
+    // PCI interrupts may already be running. Publish only after the host
+    // driver and its event sources are ready to receive card changes.
+    IOReturn status = IOCommandGateRunAction(this->commandGate, [&]() -> IOReturn
+    {
+        this->slot = newSlot;
+        return kIOReturnSuccess;
+    });
+    if (status != kIOReturnSuccess)
+    {
+        newSlot->stop(this);
+        newSlot->detach(this);
+        newSlot->release();
+        return false;
+    }
+
     pinfo("The card slot has been created and published.");
     
     return true;
@@ -838,13 +883,19 @@ void RealtekCardReaderController::destroyCardSlot()
 {
     pinfo("Stopping the card slot...");
     
-    if (this->slot != nullptr)
+    RealtekSDXCSlot* oldSlot = nullptr;
+    IOCommandGateRunAction(this->commandGate, [&]() -> IOReturn
     {
-        this->slot->stop(this);
-        
-        this->slot->detach(this);
-        
-        OSSafeReleaseNULL(this->slot);
+        oldSlot = this->slot;
+        this->slot = nullptr;
+        return kIOReturnSuccess;
+    });
+
+    if (oldSlot != nullptr)
+    {
+        oldSlot->stop(this);
+        oldSlot->detach(this);
+        oldSlot->release();
     }
 }
 

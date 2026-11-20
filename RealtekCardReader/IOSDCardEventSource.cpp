@@ -22,31 +22,21 @@ OSDefineMetaClassAndStructors(IOSDCardEventSource, IOEventSource);
 ///
 bool IOSDCardEventSource::checkForWork()
 {
-    pinfo("The card event source is invoked by the processor work loop.");
-    
-    if (this->action == nullptr)
-    {
-        perr("Detected inconsistency: The action routine should never be null.");
-        
-        return false;
-    }
-    
+    IOLockLock(this->eventLock);
     if (!this->enabled)
     {
-        pinfo("The event source is disabled.");
-        
+        IOLockUnlock(this->eventLock);
         return false;
     }
-    
-    // Acknowledge the card event
+
+    auto completion = this->completion;
+    auto options = this->options;
+    this->completion.reset();
     super::disable();
-    
-    pinfo("Processing the card event...");
-    
-    (*reinterpret_cast<Action>(this->action))(this->owner, &this->completion, this->options);
-    
-    pinfo("The card event has been processed.");
-    
+    IOLockUnlock(this->eventLock);
+
+    // A new event may arrive while the host is initializing the card.
+    (*reinterpret_cast<Action>(this->action))(this->owner, &completion, options);
     return false;
 }
 
@@ -58,14 +48,17 @@ bool IOSDCardEventSource::checkForWork()
 ///
 void IOSDCardEventSource::enable(IOSDCard::Completion* completion, IOSDCard::EventOptions options)
 {
-    super::enable();
-    
-    if (completion != nullptr)
-    {
-        this->completion = *completion;
-    }
-    
+    IOLockLock(this->eventLock);
+    auto displaced = this->completion;
+    this->completion = completion != nullptr ? *completion : IOSDCard::Completion{};
     this->options = options;
+    super::enable();
+    IOLockUnlock(this->eventLock);
+
+    if (displaced.hasAction())
+    {
+        displaced.invoke(kIOReturnAborted, nullptr);
+    }
 }
 
 ///
@@ -73,9 +66,16 @@ void IOSDCardEventSource::enable(IOSDCard::Completion* completion, IOSDCard::Eve
 ///
 void IOSDCardEventSource::disable()
 {
-    super::disable();
-    
+    IOLockLock(this->eventLock);
+    auto cancelled = this->completion;
     this->completion.reset();
+    super::disable();
+    IOLockUnlock(this->eventLock);
+
+    if (cancelled.hasAction())
+    {
+        cancelled.invoke(kIOReturnAborted, nullptr);
+    }
 }
 
 ///
@@ -108,5 +108,24 @@ IOSDCardEventSource* IOSDCardEventSource::createWithAction(OSObject* owner, Acti
         return nullptr;
     }
     
+    instance->eventLock = IOLockAlloc();
+    if (instance->eventLock == nullptr)
+    {
+        instance->release();
+        return nullptr;
+    }
+
+    instance->completion.reset();
+    instance->disable();
     return instance;
+}
+
+
+void IOSDCardEventSource::free()
+{
+    if (this->eventLock != nullptr)
+    {
+        IOLockFree(this->eventLock);
+    }
+    super::free();
 }
